@@ -108,6 +108,9 @@ class MarketOverview:
     top_concepts: List[Dict] = field(default_factory=list)    # 涨幅前5概念
     bottom_concepts: List[Dict] = field(default_factory=list) # 跌幅前5概念
 
+    # 债市/汇市/黄金核心指标（A 股复盘填充，字段见 BaseFetcher.get_bond_fx_overview）
+    bond_fx: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class MarketLightReviewResult:
@@ -573,7 +576,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
-        
+
+        # 5. 获取债市/汇市/黄金指标（仅 A 股复盘，fail-open）
+        if self.profile.has_market_stats:
+            self._get_bond_fx_overview(overview)
+
         return overview
 
     
@@ -696,7 +703,29 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.warning("[大盘] %s action=get_concept_rankings status=failed error=%s", self._log_context(), e)
-    
+
+    def _get_bond_fx_overview(self, overview: MarketOverview):
+        """获取债市/汇市/黄金核心指标（fail-open，不阻塞复盘主流程）。"""
+        try:
+            logger.info("[大盘] %s action=get_bond_fx status=start", self._log_context())
+
+            data = self.data_manager.get_bond_fx_overview()
+
+            if data:
+                overview.bond_fx = data
+                logger.info(
+                    "[大盘] %s action=get_bond_fx status=success cn_10y=%s usdcny=%s sge_gold=%s",
+                    self._log_context(),
+                    data.get("cn_10y_yield"),
+                    data.get("usdcny"),
+                    data.get("sge_gold_close"),
+                )
+            else:
+                logger.warning("[大盘] %s action=get_bond_fx status=empty", self._log_context())
+
+        except Exception as e:
+            logger.warning("[大盘] %s action=get_bond_fx status=failed error=%s", self._log_context(), e)
+
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
     #     try:
@@ -1051,6 +1080,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "markdown_report": report,
         }
 
+        if overview.bond_fx:
+            payload["bond_fx"] = dict(overview.bond_fx)
+
         if light is not None:
             payload["market_light"] = light
 
@@ -1155,6 +1187,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 review,
                 patterns["index_commentary"],
                 indices_block,
+            )
+
+        bond_fx_block = self._build_bond_fx_block(overview)
+        if bond_fx_block:
+            review = self._insert_after_section(
+                review,
+                patterns["index_commentary"],
+                bond_fx_block,
             )
 
         if sector_block:
@@ -1369,6 +1409,91 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 f"{self._format_optional_number(idx.open)} | {self._format_optional_number(idx.high)} | "
                 f"{self._format_optional_number(idx.low)} | {self._format_optional_pct(idx.amplitude)} | {amount_str} |"
             )
+        return "\n".join(lines)
+
+    def _build_bond_fx_block(self, overview: MarketOverview) -> str:
+        """构建债市/汇市/黄金指标表格（无数据时返回空串）。"""
+        data = overview.bond_fx or {}
+        if not data:
+            return ""
+        language = self._get_review_language()
+
+        def fmt_bp(value):
+            if value is None:
+                return "-"
+            return f"{value:+.1f}bp"
+
+        def fmt_pct(value):
+            if value is None:
+                return "-"
+            return f"{value:+.2f}%"
+
+        rows = []
+
+        def add_row(label, level, level_str, change):
+            if level is not None:
+                rows.append((label, level_str, change))
+
+        add_row(
+            "中国10年期国债收益率" if language != "en" else "CN 10Y Treasury Yield",
+            data.get("cn_10y_yield"),
+            f"{data.get('cn_10y_yield'):.2f}%" if data.get("cn_10y_yield") is not None else "",
+            fmt_bp(data.get("cn_10y_change_bp")),
+        )
+        add_row(
+            "中国30年期国债收益率" if language != "en" else "CN 30Y Treasury Yield",
+            data.get("cn_30y_yield"),
+            f"{data.get('cn_30y_yield'):.2f}%" if data.get("cn_30y_yield") is not None else "",
+            fmt_bp(data.get("cn_30y_change_bp")),
+        )
+        add_row(
+            "期限利差(10Y-2Y)" if language != "en" else "CN 10Y-2Y Term Spread",
+            data.get("cn_10y_2y_spread_bp"),
+            f"{data.get('cn_10y_2y_spread_bp'):.1f}bp" if data.get("cn_10y_2y_spread_bp") is not None else "",
+            fmt_bp(None),
+        )
+        add_row(
+            "美国10年期国债收益率" if language != "en" else "US 10Y Treasury Yield",
+            data.get("us_10y_yield"),
+            f"{data.get('us_10y_yield'):.2f}%" if data.get("us_10y_yield") is not None else "",
+            fmt_bp(data.get("us_10y_change_bp")),
+        )
+        add_row(
+            "中美利差(10Y)" if language != "en" else "CN-US 10Y Spread",
+            data.get("cn_us_10y_spread_bp"),
+            f"{data.get('cn_us_10y_spread_bp'):.1f}bp" if data.get("cn_us_10y_spread_bp") is not None else "",
+            fmt_bp(data.get("cn_us_10y_change_bp")),
+        )
+        add_row(
+            "美元兑人民币" if language != "en" else "USD/CNY",
+            data.get("usdcny"),
+            f"{data.get('usdcny'):.4f}" if data.get("usdcny") is not None else "",
+            fmt_pct(data.get("usdcny_change_pct")),
+        )
+        add_row(
+            "上海金 Au99.99(元/克)" if language != "en" else "SGE Gold Au99.99 (CNY/g)",
+            data.get("sge_gold_close"),
+            f"{data.get('sge_gold_close'):.2f}" if data.get("sge_gold_close") is not None else "",
+            fmt_pct(data.get("sge_gold_change_pct")),
+        )
+
+        if not rows:
+            return ""
+
+        if language == "en":
+            lines = [
+                "#### Bonds / FX / Gold",
+                "| Indicator | Last | Change |",
+                "|-----------|------|--------|",
+            ]
+        else:
+            lines = [
+                "#### 债市·汇市·黄金",
+                "| 指标 | 最新 | 日变动 |",
+                "|------|------|--------|",
+            ]
+        for label, level_str, change in rows:
+            lines.append(f"| {label} | {level_str} | {change} |")
         return "\n".join(lines)
 
     def _build_sector_block(self, overview: MarketOverview) -> str:
@@ -1686,6 +1811,74 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         stats_block = ""
         sector_block = ""
         data_limits_block = ""
+        bond_fx_prompt_block = ""
+        bond_fx = overview.bond_fx or {}
+        if bond_fx and self.profile.has_market_stats:
+            bond_lines = []
+            change_label = "daily change" if review_language == "en" else "日变动"
+
+            def _bp_text(value):
+                return f" ({change_label} {value:+.1f}bp)" if value is not None else ""
+
+            def _pct_text(value):
+                return f" ({change_label} {value:+.2f}%)" if value is not None else ""
+
+            if review_language == "en":
+                if bond_fx.get("cn_10y_yield") is not None:
+                    bond_lines.append(
+                        f"- CN 10Y treasury yield: {bond_fx.get('cn_10y_yield'):.2f}%{_bp_text(bond_fx.get('cn_10y_change_bp'))}"
+                    )
+                if bond_fx.get("cn_30y_yield") is not None:
+                    bond_lines.append(
+                        f"- CN 30Y treasury yield: {bond_fx.get('cn_30y_yield'):.2f}%{_bp_text(bond_fx.get('cn_30y_change_bp'))}"
+                    )
+                if bond_fx.get("cn_10y_2y_spread_bp") is not None:
+                    bond_lines.append(f"- CN 10Y-2Y term spread: {bond_fx.get('cn_10y_2y_spread_bp'):.1f}bp")
+                if bond_fx.get("us_10y_yield") is not None:
+                    bond_lines.append(
+                        f"- US 10Y treasury yield: {bond_fx.get('us_10y_yield'):.2f}%{_bp_text(bond_fx.get('us_10y_change_bp'))}"
+                    )
+                if bond_fx.get("cn_us_10y_spread_bp") is not None:
+                    bond_lines.append(
+                        f"- CN-US 10Y spread: {bond_fx.get('cn_us_10y_spread_bp'):.1f}bp{_bp_text(bond_fx.get('cn_us_10y_change_bp'))}"
+                    )
+                if bond_fx.get("usdcny") is not None:
+                    bond_lines.append(f"- USD/CNY: {bond_fx.get('usdcny'):.4f}{_pct_text(bond_fx.get('usdcny_change_pct'))}")
+                if bond_fx.get("sge_gold_close") is not None:
+                    bond_lines.append(
+                        f"- SGE gold Au99.99: {bond_fx.get('sge_gold_close'):.2f} CNY/g{_pct_text(bond_fx.get('sge_gold_change_pct'))}"
+                    )
+                if bond_lines:
+                    bond_fx_prompt_block = "## Bonds / FX / Gold (reference)\n" + "\n".join(bond_lines)
+            else:
+                if bond_fx.get("cn_10y_yield") is not None:
+                    bond_lines.append(
+                        f"- 中国10年期国债收益率: {bond_fx.get('cn_10y_yield'):.2f}%{_bp_text(bond_fx.get('cn_10y_change_bp'))}"
+                    )
+                if bond_fx.get("cn_30y_yield") is not None:
+                    bond_lines.append(
+                        f"- 中国30年期国债收益率: {bond_fx.get('cn_30y_yield'):.2f}%{_bp_text(bond_fx.get('cn_30y_change_bp'))}"
+                    )
+                if bond_fx.get("cn_10y_2y_spread_bp") is not None:
+                    bond_lines.append(f"- 期限利差(10Y-2Y): {bond_fx.get('cn_10y_2y_spread_bp'):.1f}bp")
+                if bond_fx.get("us_10y_yield") is not None:
+                    bond_lines.append(
+                        f"- 美国10年期国债收益率: {bond_fx.get('us_10y_yield'):.2f}%{_bp_text(bond_fx.get('us_10y_change_bp'))}"
+                    )
+                if bond_fx.get("cn_us_10y_spread_bp") is not None:
+                    bond_lines.append(
+                        f"- 中美利差(10Y): {bond_fx.get('cn_us_10y_spread_bp'):.1f}bp{_bp_text(bond_fx.get('cn_us_10y_change_bp'))}"
+                    )
+                if bond_fx.get("usdcny") is not None:
+                    bond_lines.append(
+                        f"- 美元兑人民币: {bond_fx.get('usdcny'):.4f}{_pct_text(bond_fx.get('usdcny_change_pct'))}"
+                    )
+                if bond_fx.get("sge_gold_close") is not None:
+                    bond_lines.append(
+                        f"- 上海金Au99.99: {bond_fx.get('sge_gold_close'):.2f}元/克{_pct_text(bond_fx.get('sge_gold_change_pct'))}"
+                    )
+                if bond_lines:
+                    bond_fx_prompt_block = "## 债市·汇市·黄金（参考指标）\n" + "\n".join(bond_lines)
         if review_language == "en":
             if self.profile.has_market_stats:
                 stats_block = f"""## Market Breadth
@@ -1736,6 +1929,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             if not indices_text
             else ""
         )
+        bond_fx_prompt_section = f"{bond_fx_prompt_block}\n\n" if bond_fx_prompt_block else ""
         if review_language == "en":
             data_no_indices_hint = (
                 "Note: Market data fetch failed. Rely mainly on [Market News] for qualitative analysis. Do not invent index levels."
@@ -1749,6 +1943,11 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 if data_limits_block
                 else ""
             )
+            bond_fx_requirement = (
+                "- Use the Bonds / FX / Gold reference indicators to assess liquidity (yields, CN-US spread), external balance (USD/CNY) and risk appetite (gold); do not invent levels not provided.\n"
+                if bond_fx_prompt_block
+                else ""
+            )
             market_summary_hint = (
                 "2-3 sentences summarizing overall market tone, index moves, and liquidity."
                 if self.profile.has_market_stats
@@ -1760,6 +1959,11 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             data_boundary_requirement = (
                 "- 严格遵守数据边界：未提供涨跌家数、资金流、成交额汇总或板块榜时，不要编造或过度解读。\n"
                 if data_limits_block
+                else ""
+            )
+            bond_fx_requirement = (
+                "- 结合【债市·汇市·黄金】参考指标分析流动性环境（国债收益率、中美利差）、外部平衡（美元兑人民币）与避险情绪（金价），未提供的数值不要编造。\n"
+                if bond_fx_prompt_block
                 else ""
             )
             market_summary_hint = (
@@ -1789,7 +1993,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 - No code blocks
 - Use emoji sparingly in headings (at most one per heading)
 - The entire fixed shell, headings, guidance, and conclusion must be in {shell_language_label}
-{data_boundary_requirement}
+{data_boundary_requirement}{bond_fx_requirement}
 
 ---
 
@@ -1803,7 +2007,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
 {stats_block}
 
-{sector_block}
+{bond_fx_prompt_section}{sector_block}
 
 {data_limits_block}
 
@@ -1843,7 +2047,7 @@ Output the report content directly, no extra commentary.
 - emoji 仅在标题处少量使用（每个标题最多1个）
 - {workflow_hint}
 - 不要重复列出已由系统注入的表格数据；正文负责解释表格背后的含义
-{data_boundary_requirement}
+{data_boundary_requirement}{bond_fx_requirement}
 
 ---
 
@@ -1857,7 +2061,7 @@ Output the report content directly, no extra commentary.
 
 {stats_block}
 
-{sector_block}
+{bond_fx_prompt_section}{sector_block}
 
 {data_limits_block}
 
@@ -1938,6 +2142,8 @@ Output the report content directly, no extra commentary.
 ### 3. Breadth & Liquidity
 {stats_block}
 """
+            bond_fx_block = self._build_bond_fx_block(overview)
+            bond_fx_section = f"\n{bond_fx_block}\n\n" if bond_fx_block else ""
             sector_section = ""
             if self.profile.has_sector_rankings and (top_text or bottom_text or top_concept_text or bottom_concept_text):
                 sector_section = f"""
@@ -1961,7 +2167,7 @@ Today's {self._get_market_scope_name(template_language)} showed **{market_mood}*
 
 ### 2. Major Indices
 {indices_text or "- No index data available"}
-{stats_section}
+{bond_fx_section}{stats_section}
 {sector_section}
 ### 5. Risk Alerts
 Market conditions can change quickly. The data above is for reference only and does not constitute investment advice.
@@ -1981,6 +2187,8 @@ Market conditions can change quickly. The data above is for reference only and d
             else ""
         )
         indices_block = self._build_indices_block(overview)
+        bond_fx_block = self._build_bond_fx_block(overview)
+        bond_fx_section = f"\n{bond_fx_block}\n" if bond_fx_block else ""
         sector_block = self._build_sector_block(overview) if self.profile.has_sector_rankings else ""
         summary_focus = (
             "指数承接、成交额变化和板块持续性"
@@ -2021,7 +2229,7 @@ Market conditions can change quickly. The data above is for reference only and d
 
 ### 二、指数结构
 {indices_block or indices_text or "暂无指数数据。"}
-{sector_section}
+{bond_fx_section}{sector_section}
 {funds_section}
 
 ### 五、消息催化

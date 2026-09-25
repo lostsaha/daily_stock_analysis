@@ -1995,6 +1995,167 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 获取指数行情失败: {e}")
             return None
 
+    def get_bond_fx_overview(self) -> Optional[Dict[str, Any]]:
+        """
+        获取债市/汇市/黄金核心指标（中美国债收益率、美元兑人民币、上海金Au99.99）
+
+        三个子数据源彼此独立获取，单一失败不影响其余字段（fail-open）。
+        """
+        import akshare as ak
+        from datetime import timedelta
+
+        result: Dict[str, Any] = {}
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        end_date = datetime.now().strftime("%Y%m%d")
+
+        # 1) 中美国债收益率（东方财富）
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            df = _akshare_call_with_timeout(
+                ak.bond_zh_us_rate,
+                start_date=start_date,
+                timeout=30,
+                call_name="ak.bond_zh_us_rate",
+            )
+            if df is not None and not df.empty:
+                latest = df.iloc[-1]
+                prev = df.iloc[-2] if len(df) >= 2 else None
+
+                def _yield(row, col):
+                    return safe_float(row.get(col)) if row is not None else None
+
+                def _yield_change_bp(col):
+                    cur = _yield(latest, col)
+                    if cur is None or prev is None:
+                        return None
+                    before = _yield(prev, col)
+                    if before is None:
+                        return None
+                    return (cur - before) * 100.0
+
+                cn_10y = _yield(latest, "中国国债收益率10年")
+                cn_2y = _yield(latest, "中国国债收益率2年")
+                cn_30y = _yield(latest, "中国国债收益率30年")
+                us_10y = _yield(latest, "美国国债收益率10年")
+                cn_10y_2y = _yield(latest, "中国国债收益率10年-2年")
+
+                if cn_10y is not None:
+                    result["cn_10y_yield"] = cn_10y
+                    result["cn_10y_change_bp"] = _yield_change_bp("中国国债收益率10年")
+                if cn_2y is not None:
+                    result["cn_2y_yield"] = cn_2y
+                if cn_30y is not None:
+                    result["cn_30y_yield"] = cn_30y
+                    result["cn_30y_change_bp"] = _yield_change_bp("中国国债收益率30年")
+                if cn_10y_2y is not None:
+                    result["cn_10y_2y_spread_bp"] = cn_10y_2y * 100.0
+                if us_10y is not None:
+                    result["us_10y_yield"] = us_10y
+                    result["us_10y_change_bp"] = _yield_change_bp("美国国债收益率10年")
+                if cn_10y is not None and us_10y is not None:
+                    result["cn_us_10y_spread_bp"] = (cn_10y - us_10y) * 100.0
+                    if (
+                        result.get("cn_10y_change_bp") is not None
+                        and result.get("us_10y_change_bp") is not None
+                    ):
+                        result["cn_us_10y_change_bp"] = (
+                            result["cn_10y_change_bp"] - result["us_10y_change_bp"]
+                        )
+                date_value = str(latest.get("日期") or "").strip()
+                if date_value:
+                    result["as_of"] = date_value
+                logger.info(
+                    "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.bond_zh_us_rate action=parse status=ok cn_10y=%s us_10y=%s",
+                    cn_10y,
+                    us_10y,
+                )
+            else:
+                logger.warning(
+                    "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.bond_zh_us_rate action=parse status=empty"
+                )
+        except Exception as e:
+            logger.warning(
+                "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.bond_zh_us_rate action=failed error=%s",
+                e,
+            )
+
+        # 2) 美元兑人民币（中国银行牌价：央行中间价优先，中行折算价兜底；单位为每100美元）
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            df = _akshare_call_with_timeout(
+                ak.currency_boc_sina,
+                symbol="美元",
+                start_date=start_date,
+                end_date=end_date,
+                timeout=30,
+                call_name="ak.currency_boc_sina",
+            )
+            if df is not None and not df.empty:
+                series = []
+                for _, row in df.iterrows():
+                    value = safe_float(row.get("央行中间价"))
+                    if value is None:
+                        value = safe_float(row.get("中行折算价"))
+                    if value is not None and value > 0:
+                        series.append(value)
+                if series:
+                    usdcny = series[-1] / 100.0
+                    result["usdcny"] = usdcny
+                    if len(series) >= 2 and series[-2] > 0:
+                        result["usdcny_change_pct"] = (series[-1] / series[-2] - 1.0) * 100.0
+                    logger.info(
+                        "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.currency_boc_sina action=parse status=ok usdcny=%.4f",
+                        usdcny,
+                    )
+            else:
+                logger.warning(
+                    "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.currency_boc_sina action=parse status=empty"
+                )
+        except Exception as e:
+            logger.warning(
+                "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.currency_boc_sina action=failed error=%s",
+                e,
+            )
+
+        # 3) 上海金 Au99.99 日线（上海黄金交易所，元/克）
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            df = _akshare_call_with_timeout(
+                ak.spot_hist_sge,
+                symbol="Au99.99",
+                timeout=30,
+                call_name="ak.spot_hist_sge",
+            )
+            if df is not None and not df.empty:
+                closes = [safe_float(v) for v in df["close"].tolist()]
+                closes = [v for v in closes if v is not None and v > 0]
+                if closes:
+                    gold_close = closes[-1]
+                    result["sge_gold_close"] = gold_close
+                    if len(closes) >= 2 and closes[-2] > 0:
+                        result["sge_gold_change_pct"] = (closes[-1] / closes[-2] - 1.0) * 100.0
+                    gold_date = str(df["date"].iloc[-1]) if "date" in df.columns else ""
+                    if gold_date:
+                        result.setdefault("as_of", str(gold_date)[:10])
+                    logger.info(
+                        "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.spot_hist_sge action=parse status=ok close=%.2f",
+                        gold_close,
+                    )
+            else:
+                logger.warning(
+                    "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.spot_hist_sge action=parse status=empty"
+                )
+        except Exception as e:
+            logger.warning(
+                "[BondFx] component=bond_fx provider=AkshareFetcher api=ak.spot_hist_sge action=failed error=%s",
+                e,
+            )
+
+        return result or None
+
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """
         获取市场涨跌统计

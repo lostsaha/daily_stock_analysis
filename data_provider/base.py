@@ -426,6 +426,30 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_bond_fx_overview(self) -> Optional[Dict[str, Any]]:
+        """
+        获取债市/汇市/黄金核心指标（A 股复盘的跨资产参考数据）
+
+        Returns:
+            Dict: 包含（各字段独立获取，允许部分缺失）:
+                - as_of: 数据日期 (YYYY-MM-DD)
+                - cn_10y_yield: 中国10年期国债收益率(%)
+                - cn_10y_change_bp: 中国10年期收益率日变动(bp)
+                - cn_2y_yield: 中国2年期国债收益率(%)
+                - cn_30y_yield: 中国30年期国债收益率(%)
+                - cn_30y_change_bp: 中国30年期收益率日变动(bp)
+                - cn_10y_2y_spread_bp: 中国10年-2年期限利差(bp)
+                - us_10y_yield: 美国10年期国债收益率(%)
+                - us_10y_change_bp: 美国10年期收益率日变动(bp)
+                - cn_us_10y_spread_bp: 中美10年期利差(bp)
+                - cn_us_10y_change_bp: 中美利差日变动(bp)
+                - usdcny: 美元兑人民币汇率
+                - usdcny_change_pct: 美元兑人民币日变动(%)
+                - sge_gold_close: 上海金Au99.99收盘价(元/克)
+                - sge_gold_change_pct: 上海金日涨跌幅(%)
+        """
+        return None
+
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """
         获取市场人气股榜。
@@ -3338,6 +3362,35 @@ class DataFetcherManager:
                 )
                 continue
         logger.warning("[MarketStats] component=market_stats action=complete status=empty purpose=%s", purpose)
+        return {}
+
+    def get_bond_fx_overview(self) -> Dict[str, Any]:
+        """获取债市/汇市/黄金核心指标（自动切换数据源）"""
+        for fetcher in self._fetchers:
+            started_at = time.monotonic()
+            try:
+                data = fetcher.get_bond_fx_overview()
+                elapsed = time.monotonic() - started_at
+                if data:
+                    logger.info(
+                        "[BondFx] component=bond_fx action=provider_success provider=%s elapsed=%.2fs",
+                        fetcher.name,
+                        elapsed,
+                    )
+                    return data
+                logger.info(
+                    "[BondFx] component=bond_fx action=provider_empty provider=%s elapsed=%.2fs",
+                    fetcher.name,
+                    elapsed,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[BondFx] component=bond_fx action=provider_failed provider=%s error=%s",
+                    fetcher.name,
+                    e,
+                )
+                continue
+        logger.warning("[BondFx] component=bond_fx action=complete status=empty")
         return {}
 
     def _run_with_timeout(
